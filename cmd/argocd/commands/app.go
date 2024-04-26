@@ -45,11 +45,13 @@ import (
 	"github.com/argoproj/argo-cd/v2/reposerver/repository"
 	"github.com/argoproj/argo-cd/v2/util/argo"
 	argodiff "github.com/argoproj/argo-cd/v2/util/argo/diff"
+	"github.com/argoproj/argo-cd/v2/util/argo/normalizers"
 	"github.com/argoproj/argo-cd/v2/util/cli"
 	"github.com/argoproj/argo-cd/v2/util/errors"
 	"github.com/argoproj/argo-cd/v2/util/git"
 	"github.com/argoproj/argo-cd/v2/util/grpc"
 	argoio "github.com/argoproj/argo-cd/v2/util/io"
+	logutils "github.com/argoproj/argo-cd/v2/util/log"
 	"github.com/argoproj/argo-cd/v2/util/manifeststream"
 	"github.com/argoproj/argo-cd/v2/util/templates"
 	"github.com/argoproj/argo-cd/v2/util/text/label"
@@ -1116,17 +1118,18 @@ type objKeyLiveTarget struct {
 // NewApplicationDiffCommand returns a new instance of an `argocd app diff` command
 func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
-		refresh            bool
-		hardRefresh        bool
-		exitCode           bool
-		local              string
-		revision           string
-		localRepoRoot      string
-		serverSideGenerate bool
-		localIncludes      []string
-		appNamespace       string
-		revisions          []string
-		sourcePositions    []int64
+		refresh              bool
+		hardRefresh          bool
+		exitCode             bool
+		local                string
+		revision             string
+		localRepoRoot        string
+		serverSideGenerate   bool
+		localIncludes        []string
+		appNamespace         string
+		revisions            []string
+		sourcePositions      []int64
+		ignoreNormalizerOpts normalizers.IgnoreNormalizerOpts
 	)
 	shortDesc := "Perform a diff against the target and live state."
 	var command = &cobra.Command{
@@ -1164,25 +1167,25 @@ func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 			errors.CheckError(err)
 			diffOption := &DifferenceOption{}
 			if app.Spec.HasMultipleSources() && len(revisions) > 0 && len(sourcePositions) > 0 {
-
-				revisionSourceMappings := make(map[int64]string, 0)
-				for i, pos := range sourcePositions {
-					if pos <= 0 {
-						errors.CheckError(fmt.Errorf("source-position cannot be less than or equal to 0. Counting starts at 1."))
+				numOfSources := int64(len(app.Spec.GetSources()))
+				for _, pos := range sourcePositions {
+					if pos <= 0 || pos > numOfSources {
+						log.Fatal("source-position cannot be less than 1 or more than number of sources in the app. Counting starts at 1.")
 					}
-					revisionSourceMappings[pos] = revisions[i]
 				}
 
 				q := application.ApplicationManifestQuery{
-					Name:                   &appName,
-					AppNamespace:           &appNs,
-					RevisionSourceMappings: revisionSourceMappings,
+					Name:            &appName,
+					AppNamespace:    &appNs,
+					Revisions:       revisions,
+					SourcePositions: sourcePositions,
 				}
 				res, err := appIf.GetManifests(ctx, &q)
 				errors.CheckError(err)
 
 				diffOption.res = res
-				diffOption.revisionSourceMappings = &revisionSourceMappings
+				diffOption.revisions = revisions
+				diffOption.sourcePositions = sourcePositions
 			} else if revision != "" {
 				q := application.ApplicationManifestQuery{
 					Name:         &appName,
@@ -1218,7 +1221,7 @@ func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				}
 			}
 			proj := getProject(c, clientOpts, ctx, app.Spec.Project)
-			foundDiffs := findandPrintDiff(ctx, app, proj.Project, resources, argoSettings, diffOption)
+			foundDiffs := findandPrintDiff(ctx, app, proj.Project, resources, argoSettings, diffOption, ignoreNormalizerOpts)
 			if foundDiffs && exitCode {
 				os.Exit(1)
 			}
@@ -1235,22 +1238,24 @@ func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 	command.Flags().StringVarP(&appNamespace, "app-namespace", "N", "", "Only render the difference in namespace")
 	command.Flags().StringArrayVar(&revisions, "revisions", []string{}, "Show manifests at specific revisions for source position in source-positions")
 	command.Flags().Int64SliceVar(&sourcePositions, "source-positions", []int64{}, "List of source positions. Default is empty array. Counting start at 1.")
+	command.Flags().DurationVar(&ignoreNormalizerOpts.JQExecutionTimeout, "ignore-normalizer-jq-execution-timeout", normalizers.DefaultJQExecutionTimeout, "Set ignore normalizer JQ execution timeout")
 	return command
 }
 
 // DifferenceOption struct to store diff options
 type DifferenceOption struct {
-	local                  string
-	localRepoRoot          string
-	revision               string
-	cluster                *argoappv1.Cluster
-	res                    *repoapiclient.ManifestResponse
-	serversideRes          *repoapiclient.ManifestResponse
-	revisionSourceMappings *map[int64]string
+	local           string
+	localRepoRoot   string
+	revision        string
+	cluster         *argoappv1.Cluster
+	res             *repoapiclient.ManifestResponse
+	serversideRes   *repoapiclient.ManifestResponse
+	revisions       []string
+	sourcePositions []int64
 }
 
 // findandPrintDiff ... Prints difference between application current state and state stored in git or locally, returns boolean as true if difference is found else returns false
-func findandPrintDiff(ctx context.Context, app *argoappv1.Application, proj *argoappv1.AppProject, resources *application.ManagedResourcesResponse, argoSettings *settings.Settings, diffOptions *DifferenceOption) bool {
+func findandPrintDiff(ctx context.Context, app *argoappv1.Application, proj *argoappv1.AppProject, resources *application.ManagedResourcesResponse, argoSettings *settings.Settings, diffOptions *DifferenceOption, ignoreNormalizerOpts normalizers.IgnoreNormalizerOpts) bool {
 	var foundDiffs bool
 	liveObjs, err := cmdutil.LiveObjects(resources.Items)
 	errors.CheckError(err)
@@ -1258,7 +1263,7 @@ func findandPrintDiff(ctx context.Context, app *argoappv1.Application, proj *arg
 	if diffOptions.local != "" {
 		localObjs := groupObjsByKey(getLocalObjects(ctx, app, proj, diffOptions.local, diffOptions.localRepoRoot, argoSettings.AppLabelKey, diffOptions.cluster.Info.ServerVersion, diffOptions.cluster.Info.APIVersions, argoSettings.KustomizeOptions, argoSettings.TrackingMethod), liveObjs, app.Spec.Destination.Namespace)
 		items = groupObjsForDiff(resources, localObjs, items, argoSettings, app.InstanceName(argoSettings.ControllerNamespace), app.Spec.Destination.Namespace)
-	} else if diffOptions.revision != "" || (diffOptions.revisionSourceMappings != nil) {
+	} else if diffOptions.revision != "" || (diffOptions.revisions != nil && len(diffOptions.revisions) > 0) {
 		var unstructureds []*unstructured.Unstructured
 		for _, mfst := range diffOptions.res.Manifests {
 			obj, err := argoappv1.UnmarshalToUnstructured(mfst)
@@ -1305,9 +1310,10 @@ func findandPrintDiff(ctx context.Context, app *argoappv1.Application, proj *arg
 		// compareOptions in the protobuf
 		ignoreAggregatedRoles := false
 		diffConfig, err := argodiff.NewDiffConfigBuilder().
-			WithDiffSettings(app.Spec.IgnoreDifferences, overrides, ignoreAggregatedRoles).
+			WithDiffSettings(app.Spec.IgnoreDifferences, overrides, ignoreAggregatedRoles, ignoreNormalizerOpts).
 			WithTracking(argoSettings.AppLabelKey, argoSettings.TrackingMethod).
 			WithNoCache().
+			WithLogger(logutils.NewLogrusLogger(logutils.NewWithCurrentConfig())).
 			Build()
 		errors.CheckError(err)
 		diffRes, err := argodiff.StateDiff(item.live, item.target, diffConfig)
@@ -1827,6 +1833,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 		projects                []string
 		output                  string
 		appNamespace            string
+		ignoreNormalizerOpts    normalizers.IgnoreNormalizerOpts
 	)
 	var command = &cobra.Command{
 		Use:   "sync [APPNAME... | -l selector | --project project-name]",
@@ -2058,7 +2065,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 					fmt.Printf("====== Previewing differences between live and desired state of application %s ======\n", appQualifiedName)
 
 					proj := getProject(c, clientOpts, ctx, app.Spec.Project)
-					foundDiffs = findandPrintDiff(ctx, app, proj.Project, resources, argoSettings, diffOption)
+					foundDiffs = findandPrintDiff(ctx, app, proj.Project, resources, argoSettings, diffOption, ignoreNormalizerOpts)
 					if foundDiffs {
 						if !diffChangesConfirm {
 							yesno := cli.AskToProceed(fmt.Sprintf("Please review changes to application %s shown above. Do you want to continue the sync process? (y/n): ", appQualifiedName))
@@ -2117,6 +2124,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 	command.Flags().StringArrayVar(&projects, "project", []string{}, "Sync apps that belong to the specified projects. This option may be specified repeatedly.")
 	command.Flags().StringVarP(&output, "output", "o", "wide", "Output format. One of: json|yaml|wide|tree|tree=detailed")
 	command.Flags().StringVarP(&appNamespace, "app-namespace", "N", "", "Only sync an application in namespace")
+	command.Flags().DurationVar(&ignoreNormalizerOpts.JQExecutionTimeout, "ignore-normalizer-jq-execution-timeout", normalizers.DefaultJQExecutionTimeout, "Set ignore normalizer JQ execution timeout")
 	return command
 }
 
@@ -2768,6 +2776,12 @@ func NewApplicationManifestsCommand(clientOpts *argocdclient.ClientOptions) *cob
 				errors.CheckError(fmt.Errorf("While using revisions and source-positions, length of values for both flags should be same."))
 			}
 
+			for _, pos := range sourcePositions {
+				if pos <= 0 {
+					log.Fatal("source-position cannot be less than or equal to 0, Counting starts at 1")
+				}
+			}
+
 			appName, appNs := argo.ParseFromQualifiedName(args[0], "")
 			clientset := headless.NewClientOrDie(clientOpts, c)
 			conn, appIf := clientset.NewApplicationClientOrDie()
@@ -2800,19 +2814,12 @@ func NewApplicationManifestsCommand(clientOpts *argocdclient.ClientOptions) *cob
 					unstructureds = getLocalObjects(context.Background(), app, proj.Project, local, localRepoRoot, argoSettings.AppLabelKey, cluster.ServerVersion, cluster.Info.APIVersions, argoSettings.KustomizeOptions, argoSettings.TrackingMethod)
 				} else if len(revisions) > 0 && len(sourcePositions) > 0 {
 
-					revisionSourceMappings := make(map[int64]string, 0)
-					for i, pos := range sourcePositions {
-						if pos <= 0 {
-							errors.CheckError(fmt.Errorf("source-position cannot be less than or equal to 0, Counting starts at 1"))
-						}
-						revisionSourceMappings[pos] = revisions[i]
-					}
-
 					q := application.ApplicationManifestQuery{
-						Name:                   &appName,
-						AppNamespace:           &appNs,
-						Revision:               pointer.String(revision),
-						RevisionSourceMappings: revisionSourceMappings,
+						Name:            &appName,
+						AppNamespace:    &appNs,
+						Revision:        pointer.String(revision),
+						Revisions:       revisions,
+						SourcePositions: sourcePositions,
 					}
 					res, err := appIf.GetManifests(ctx, &q)
 					errors.CheckError(err)
